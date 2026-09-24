@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { config } from '../config.js'
+import { usageFromMessage, unavailableUsage } from './usage.js'
 
 export let anthropic = new Anthropic({ apiKey: config.anthropicApiKey })
 
@@ -205,6 +206,7 @@ This function handles a basic Stellar payment operation suitable for agent-to-ag
 async function callClaude(model, maxTokens, prompt, fallbackFn, fallbackInput, options = {}) {
   if (!config.anthropicApiKey) {
     console.log('  ℹ️  No API key — using demo response')
+    options.onUsage?.(unavailableUsage(model, 'no_api_key'))
     return fallbackFn(fallbackInput)
   }
 
@@ -220,6 +222,7 @@ async function callClaude(model, maxTokens, prompt, fallbackFn, fallbackInput, o
       }
     )
     claudeAvailable = true
+    options.onUsage?.(usageFromMessage(msg, model))
     return msg.content[0].type === 'text' ? msg.content[0].text : ''
   } catch (err) {
     console.error(`Claude API error: ${err.message}`)
@@ -232,8 +235,10 @@ async function callClaude(model, maxTokens, prompt, fallbackFn, fallbackInput, o
         console.log('  ⚠️  Claude API credits exhausted — switching to demo responses')
         claudeAvailable = false
       }
+      options.onUsage?.(unavailableUsage(model, 'credits_exhausted_fallback'))
       return fallbackFn(fallbackInput)
     }
+    options.onUsage?.(unavailableUsage(model, 'error'))
     throw err
   }
 }
