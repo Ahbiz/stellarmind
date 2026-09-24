@@ -374,3 +374,4 @@ cd stellarmind
 ### CI Status
 
 Automated testing and linting configured via GitHub Actions.
+pr-test
