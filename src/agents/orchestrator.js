@@ -1,4 +1,4 @@
-import { config } from '../config.js'
+﻿import { config } from '../config.js'
 import { AGENTS, getAgentById } from './registry.js'
 import {
   runResearch,
@@ -24,6 +24,12 @@ import {
   countUsed,
   countSkipped,
 } from './budget.js'
+import {
+  usageFromMessage,
+  unavailableUsage,
+  recordUsageEntry,
+  summarizeUsageByPhase,
+} from './usage.js'
 
 // const anthropic = ... (imported from services.js)
 
@@ -203,6 +209,10 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
             !settlementFailed && !txHash
               ? 'x402 settlement completed without transaction hash header'
               : undefined,
+          // The premium endpoint served this call remotely — we never touched
+          // the Anthropic client ourselves, so provider token usage is
+          // genuinely unknown here, not zero.
+          usage: unavailableUsage(agent.model || null, 'x402_remote_call'),
         }
       }
 
@@ -244,6 +254,7 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
 
   const serviceFn = SERVICE_MAP[agent.id]
   let result
+  let capturedUsage = null
   try {
     result = await serviceFn(input, {
       onRetryAttempt: (retry) => {
@@ -258,6 +269,12 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
           error: retry.error,
           timestamp: new Date().toISOString(),
         })
+      },
+      // Services may report more than one attempt (e.g. a failed primary
+      // model call followed by a successful fallback-model call). Keep the
+      // most recent report — the one that actually produced `result`.
+      onUsage: (usage) => {
+        capturedUsage = usage
       },
     })
   } catch (err) {
@@ -291,13 +308,17 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
     paidVia: paymentResult.success ? 'stellar-xlm-direct' : 'none',
     txHash,
     explorerUrl: paymentResult.explorerUrl || buildExplorerUrl(txHash),
+    usage: capturedUsage || unavailableUsage(agent.model || null, 'no_usage_captured'),
   }
 }
+
+const PLANNING_MODEL = 'claude-haiku-4-5-20251001'
 
 export async function orchestrate(task, budget, broadcastFn, context = {}) {
   const startTime = Date.now()
   const results = []
   const payments = []
+  const usageEntries = []
   let totalSpent = 0
   let x402PaymentCount = 0
   let xlmFallbackCount = 0
@@ -321,10 +342,11 @@ export async function orchestrate(task, budget, broadcastFn, context = {}) {
   ).join('\n')
 
   let plan
+  let planningUsageEntry = null
   try {
     const planResponse = await createAnthropicMessage(
       {
-        model: 'claude-haiku-4-5-20251001',
+        model: PLANNING_MODEL,
         max_tokens: 400,
         messages: [
           {
@@ -365,6 +387,14 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       }
     )
 
+    // Capture usage from the successful call before parsing — a malformed
+    // plan (JSON.parse failure below) still consumed real provider tokens.
+    planningUsageEntry = recordUsageEntry(
+      'planning',
+      null,
+      usageFromMessage(planResponse, PLANNING_MODEL)
+    )
+
     const planText = planResponse.content[0].type === 'text' ? planResponse.content[0].text : '{}'
     const cleanJson = planText
       .replace(/```json\n?/g, '')
@@ -376,6 +406,16 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       correlationId: context.correlationId,
       error: err.message?.substring(0, 120),
     })
+    // Only record "unavailable" if we didn't already capture real usage
+    // above (e.g. the API call itself failed/timed out, vs. the call
+    // succeeding but returning unparseable JSON).
+    if (!planningUsageEntry) {
+      planningUsageEntry = recordUsageEntry(
+        'planning',
+        null,
+        unavailableUsage(PLANNING_MODEL, 'planning_call_failed')
+      )
+    }
     const subtasks = []
     let remaining = budget
 
@@ -409,6 +449,8 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       subtasks,
     }
   }
+
+  usageEntries.push(planningUsageEntry)
 
   broadcastFn?.({
     type: 'orchestrator_plan',
@@ -470,6 +512,12 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     else if (bucket === 'stellar-xlm') xlmFallbackCount += 1
     else unpaidCount += 1
 
+    // Provider token usage is tracked independently of the settled
+    // marketplace charge (agent.price / cost, accumulated into totalSpent
+    // above) — it never alters or substitutes for that settled amount.
+    const stepUsageEntry = recordUsageEntry('agent', agent.id, agentResponse.usage)
+    usageEntries.push(stepUsageEntry)
+
     const agentResult = {
       agentId: agent.id,
       agentName: agent.name,
@@ -482,6 +530,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       paymentSuccess: agentResponse.paymentSuccess,
       txHash: agentResponse.txHash || null,
       explorerUrl: agentResponse.explorerUrl || null,
+      usage: stepUsageEntry,
     }
 
     results.push(agentResult)
@@ -526,6 +575,9 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   const paymentProtocol = paymentProtocolSummary(x402PaymentCount, xlmFallbackCount)
   const successfulPayments = payments.filter((p) => p.paymentSuccess)
   const successfulTxs = successfulPayments.filter((p) => p.txHash)
+  // Provider token usage, aggregated separately from the settled marketplace
+  // totals above (totalSpent / paymentProtocol / etc. are untouched by this).
+  const usageSummary = summarizeUsageByPhase(usageEntries)
 
   broadcastFn?.({
     type: 'orchestrator_complete',
@@ -540,6 +592,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     unpaidCount,
     x402WalletReady,
     x402WalletHint,
+    usageSummary,
     timestamp: new Date().toISOString(),
   })
 
@@ -562,5 +615,11 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     payments: successfulPayments,
     txCount: successfulTxs.length,
     elapsed: `${elapsed}ms`,
+    // Provider token usage — kept as its own namespace, never merged into
+    // or masquerading as the settled marketplace charges above.
+    usage: {
+      entries: usageEntries,
+      summary: usageSummary,
+    },
   }
 }

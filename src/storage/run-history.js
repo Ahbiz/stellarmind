@@ -1,6 +1,7 @@
-import fs from 'node:fs/promises'
+﻿import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { summarizeUsageByPhase } from '../agents/usage.js'
 
 function createRunId() {
   return `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
@@ -50,6 +51,10 @@ export class InMemoryRunHistoryStore {
       summary: null,
       events: [],
       txProofs: [],
+      // Provider token usage — kept separate from `summary` (settled
+      // marketplace charges) so it never alters or masquerades as those
+      // totals. Absent/unknown usage is represented explicitly, not as 0.
+      usage: null,
     }
     this.runs.unshift(run)
     this.runs = this.runs.slice(0, this.maxRuns)
@@ -90,6 +95,15 @@ export class InMemoryRunHistoryStore {
       elapsed: result.elapsed,
     }
     run.txProofs = txProofs
+    // Persist provider usage as its own field — never folded into
+    // `run.summary`'s settled marketplace totals above. If the orchestrator
+    // result carries no usage (defensive default), fall back to an
+    // explicitly-empty summary rather than fabricating zeros for a run that
+    // may well have made real provider calls.
+    run.usage = {
+      entries: result.usage?.entries || [],
+      summary: result.usage?.summary || summarizeUsageByPhase([]),
+    }
   }
 
   async failRun(runId, err) {
