@@ -2,6 +2,10 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 
+// Schema versioning constants
+const CURRENT_SCHEMA_VERSION = 1
+const LEGACY_VERSION = 0 // Unversioned files
+
 function createRunId() {
   return `run_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
 }
@@ -119,17 +123,83 @@ export class FileRunHistoryStore extends InMemoryRunHistoryStore {
     try {
       const raw = await fs.readFile(this.filePath, 'utf8')
       const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed.runs)) this.runs = parsed.runs.slice(0, this.maxRuns)
-    } catch (err) {
-      if (err.code !== 'ENOENT') {
-        console.warn(`  run history load warning: ${err.message}`)
+      const { version, runs } = this.validateAndMigrate(parsed)
+      if (Array.isArray(runs)) this.runs = runs.slice(0, this.maxRuns)
+      // If migration occurred, persist the new format
+      if (version === LEGACY_VERSION) {
+        await this.persist()
       }
-      await this.persist()
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        // File doesn't exist yet, create it
+        await this.persist()
+      } else if (err.message?.includes('Unsupported schema version')) {
+        // Future version - fail without rewriting
+        throw err
+      } else {
+        // File is corrupted or unreadable - preserve it and start fresh
+        await this.handleCorruptedFile(err)
+        await this.persist()
+      }
+    }
+  }
+
+  /**
+   * Validates schema version and migrates if needed
+   * @param {object} data - Parsed file content
+   * @returns {object} { version, runs } - Validated and potentially migrated data
+   */
+  validateAndMigrate(data) {
+    // Check for version field
+    if (data.version === undefined) {
+      // Legacy unversioned format (version 0)
+      console.warn('  run history: migrating legacy unversioned format to version 1')
+      return { version: LEGACY_VERSION, runs: data.runs || [] }
+    }
+
+    // Validate version is a number
+    const version = Number.parseInt(data.version, 10)
+    if (!Number.isFinite(version)) {
+      throw new Error(`Invalid schema version: ${data.version}`)
+    }
+
+    // Check if version is newer than what we support
+    if (version > CURRENT_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported schema version ${version}. Current supported version is ${CURRENT_SCHEMA_VERSION}. ` +
+          'Please upgrade the application to support this format.'
+      )
+    }
+
+    // Version is within supported range
+    return { version, runs: data.runs || [] }
+  }
+
+  /**
+   * Handles corrupted or unreadable files by preserving them
+   * @param {Error} err - The error that occurred
+   */
+  async handleCorruptedFile(err) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const backupPath = `${this.filePath}.corrupted.${timestamp}`
+    console.error(`  run history: file is corrupted, preserving at ${backupPath}`)
+    console.error(`  run history: error was: ${err.message}`)
+    try {
+      await fs.rename(this.filePath, backupPath)
+    } catch (renameErr) {
+      console.warn(`  run history: failed to preserve corrupted file: ${renameErr.message}`)
     }
   }
 
   async persist() {
-    const payload = JSON.stringify({ runs: this.runs.slice(0, this.maxRuns) }, null, 2)
+    const payload = JSON.stringify(
+      {
+        version: CURRENT_SCHEMA_VERSION,
+        runs: this.runs.slice(0, this.maxRuns),
+      },
+      null,
+      2
+    )
     const tempPath = `${this.filePath}.tmp`
     await fs.writeFile(tempPath, payload, 'utf8')
     await fs.rename(tempPath, this.filePath)
