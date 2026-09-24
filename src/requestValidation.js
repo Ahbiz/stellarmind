@@ -1,3 +1,5 @@
+import { AssetAmount, getAssetPrecision, DEFAULT_ASSET } from './agents/amount.js'
+
 const DEFAULT_BUDGET = 0.15
 const MAX_TOPIC_LENGTH = 500
 const MAX_SUMMARY_TEXT_LENGTH = 5000
@@ -74,15 +76,17 @@ function assertStringField(
   }
 }
 
-function assertBudget(value) {
+function assertBudget(value, asset = DEFAULT_ASSET) {
   if (value === undefined || value === null || value === '') {
     return {
       valid: true,
       value: DEFAULT_BUDGET,
+      amount: AssetAmount.from(DEFAULT_BUDGET, asset),
     }
   }
 
-  const parsed = Number(value)
+  const str = String(value).trim()
+  const parsed = Number(str)
   if (!Number.isFinite(parsed) || Number.isNaN(parsed)) {
     return {
       valid: false,
@@ -105,9 +109,42 @@ function assertBudget(value) {
     }
   }
 
+  const maxPrecision = getAssetPrecision(asset)
+  const parts = str.split('.')
+  if (parts.length === 2 && parts[1].length > maxPrecision) {
+    return {
+      valid: false,
+      error: {
+        field: 'budget',
+        reason: `Unsupported fractional precision: asset '${asset}' allows at most ${maxPrecision} decimal places, received ${parts[1].length} decimal places in '${value}'`,
+        code: 'UNSUPPORTED_PRECISION',
+        asset,
+        maxPrecision,
+        receivedPrecision: parts[1].length,
+        received: value,
+      },
+    }
+  }
+
+  let exactAmount
+  try {
+    exactAmount = AssetAmount.from(str, asset)
+  } catch (err) {
+    return {
+      valid: false,
+      error: {
+        field: 'budget',
+        reason: err.message,
+        code: err.code || 'INVALID_INPUT',
+        received: value,
+      },
+    }
+  }
+
   return {
     valid: true,
     value: parsed,
+    amount: exactAmount,
   }
 }
 

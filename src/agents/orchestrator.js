@@ -1,4 +1,4 @@
-﻿import { config } from '../config.js'
+import { config } from '../config.js'
 import { AGENTS, getAgentById } from './registry.js'
 import {
   runResearch,
@@ -14,10 +14,12 @@ import { x402Client, x402HTTPClient, wrapFetchWithPayment } from '@x402/fetch'
 import { ExactStellarScheme, createEd25519Signer } from '@x402/stellar'
 import { parseSettlementHeader, extractTxHash } from './settlement-header.js'
 import {
+  AssetAmount,
   agentCost,
   exceedsBudget,
   buildSkipResult,
   buildBudgetLimitEvent,
+  formatAmount,
   paymentBucket,
   paymentProtocolSummary,
   isBudgetExhausted,
@@ -319,7 +321,8 @@ export async function orchestrate(task, budget, broadcastFn, context = {}) {
   const results = []
   const payments = []
   const usageEntries = []
-  let totalSpent = 0
+  const exactBudget = AssetAmount.from(budget, 'USDC')
+  let totalSpent = AssetAmount.zero('USDC')
   let x402PaymentCount = 0
   let xlmFallbackCount = 0
   let unpaidCount = 0
@@ -417,31 +420,36 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       )
     }
     const subtasks = []
-    let remaining = budget
+    let remaining = exactBudget
 
-    if (remaining >= 0.01) {
+    const researchCost = AssetAmount.from('0.01', 'USDC')
+    const summaryCost = AssetAmount.from('0.01', 'USDC')
+    const analystCost = AssetAmount.from('0.05', 'USDC')
+    const codeCost = AssetAmount.from('0.03', 'USDC')
+
+    if (remaining.isGreaterThanOrEqualTo(researchCost)) {
       subtasks.push({ agentId: 'research-bot', input: task, cost: '0.01' })
-      remaining -= 0.01
+      remaining = remaining.minus(researchCost)
     }
-    if (remaining >= 0.01) {
+    if (remaining.isGreaterThanOrEqualTo(summaryCost)) {
       subtasks.push({
         agentId: 'summary-bot',
         input: `Summarize findings about: ${task}`,
         cost: '0.01',
       })
-      remaining -= 0.01
+      remaining = remaining.minus(summaryCost)
     }
-    if (remaining >= 0.05) {
+    if (remaining.isGreaterThanOrEqualTo(analystCost)) {
       subtasks.push({ agentId: 'analyst-bot', input: task, cost: '0.05' })
-      remaining -= 0.05
+      remaining = remaining.minus(analystCost)
     }
-    if (remaining >= 0.03) {
+    if (remaining.isGreaterThanOrEqualTo(codeCost)) {
       subtasks.push({
         agentId: 'code-bot',
         input: `Write an implementation related to: ${task}`,
         cost: '0.03',
       })
-      remaining -= 0.03
+      remaining = remaining.minus(codeCost)
     }
 
     plan = {
@@ -468,12 +476,12 @@ Respond ONLY with valid JSON (no markdown, no code fences):
 
     const cost = agentCost(agent)
 
-    if (exceedsBudget(totalSpent, cost, budget)) {
+    if (exceedsBudget(totalSpent, cost, exactBudget)) {
       broadcastFn?.({
-        ...buildBudgetLimitEvent(agent, budget, totalSpent),
+        ...buildBudgetLimitEvent(agent, exactBudget, totalSpent),
         timestamp: new Date().toISOString(),
       })
-      results.push(buildSkipResult(agent, budget, totalSpent))
+      results.push(buildSkipResult(agent, exactBudget, totalSpent))
       continue
     }
 
@@ -505,7 +513,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
           ? agentResponse.result
           : JSON.stringify(agentResponse.result)
     }
-    totalSpent += cost
+    totalSpent = totalSpent.plus(cost)
 
     const bucket = paymentBucket(agentResponse.paidVia)
     if (bucket === 'x402') x402PaymentCount += 1
@@ -571,7 +579,7 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   }
 
   const elapsed = Date.now() - startTime
-  const budgetExhausted = isBudgetExhausted(totalSpent, budget)
+  const budgetExhausted = isBudgetExhausted(totalSpent, exactBudget)
   const paymentProtocol = paymentProtocolSummary(x402PaymentCount, xlmFallbackCount)
   const successfulPayments = payments.filter((p) => p.paymentSuccess)
   const successfulTxs = successfulPayments.filter((p) => p.txHash)
@@ -581,7 +589,8 @@ Respond ONLY with valid JSON (no markdown, no code fences):
 
   broadcastFn?.({
     type: 'orchestrator_complete',
-    totalSpent: totalSpent.toFixed(4),
+    totalSpent: formatAmount(totalSpent),
+    totalSpentExact: totalSpent.toJSON(),
     agentsUsed: countUsed(results),
     agentsSkipped: countSkipped(results),
     elapsed: `${elapsed}ms`,
@@ -599,8 +608,10 @@ Respond ONLY with valid JSON (no markdown, no code fences):
   return {
     task,
     plan: plan.plan,
-    budget,
-    totalSpent: totalSpent.toFixed(4),
+    budget: typeof budget === 'number' ? budget : exactBudget.toNumber(),
+    budgetExact: exactBudget.toJSON(),
+    totalSpent: formatAmount(totalSpent),
+    totalSpentExact: totalSpent.toJSON(),
     budgetExhausted,
     agentsUsed: countUsed(results),
     agentsSkipped: countSkipped(results),
