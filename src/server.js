@@ -16,6 +16,7 @@ import {
   MODEL_LABELS,
 } from './agents/services.js'
 import { orchestrate } from './agents/orchestrator.js'
+import { OrchestrationAdmissionQueue } from './agents/orchestration-queue.js'
 import { getBalance, getTransactions } from './stellar/wallet.js'
 import { requestId, requestLogger, errorHandler } from './middleware/errorHandler.js'
 import { apikeyLimiter } from './middleware/rateLimiter.js'
@@ -62,6 +63,7 @@ app.use(requestLogger)
 const sseClients = []
 let x402MiddlewareReady = false
 const runHistoryStore = await createRunHistoryStore(config)
+const admissionQueue = new OrchestrationAdmissionQueue(config.orchestrationQueue)
 
 function broadcast(event) {
   const data = JSON.stringify(event)
@@ -368,67 +370,133 @@ app.get('/api/code', async (req, res, next) => {
   }
 })
 
-// ─── Orchestrator Endpoint ───────────────────────────────────
-app.post('/api/orchestrate', validateOrchestrate, async (req, res, next) => {
-  try {
-    const { task, budget } = req.validated
-    const run = await runHistoryStore.createRun({
-      task,
-      budget,
-      source: 'POST /api/orchestrate',
+// ─── Orchestrator Handler ────────────────────────────────────
+async function handleOrchestration(req, res, next, source) {
+  const { task, budget } = req.validated
+  const run = await runHistoryStore.createRun({
+    task,
+    budget,
+    source,
+  })
+  const runBroadcast = (event) => {
+    const eventWithRun = { ...event, runId: run.id }
+    broadcast(eventWithRun)
+    runHistoryStore.appendEvent(run.id, eventWithRun).catch((persistErr) => {
+      logger.warn('run_history_append_failed', { runId: run.id, error: persistErr.message })
     })
-    const runBroadcast = (event) => {
-      const eventWithRun = { ...event, runId: run.id }
-      broadcast(eventWithRun)
-      runHistoryStore.appendEvent(run.id, eventWithRun).catch((persistErr) => {
-        logger.warn('run_history_append_failed', { runId: run.id, error: persistErr.message })
-      })
-    }
+  }
 
-    let result
-    try {
-      result = await orchestrate(task, budget, runBroadcast, { correlationId: req.requestId })
-      await runHistoryStore.completeRun(run.id, result)
-    } catch (err) {
-      await runHistoryStore.failRun(run.id, err)
-      throw err
+  const clientAbortController = new AbortController()
+  const onClose = () => {
+    if (!res.writableEnded) {
+      clientAbortController.abort(new Error('Client disconnected'))
     }
+  }
+  res.on('close', onClose)
+  req.on('aborted', onClose)
 
+  try {
+    const result = await admissionQueue.run(
+      async ({ signal }) => {
+        return orchestrate(task, budget, runBroadcast, {
+          correlationId: req.requestId,
+          signal,
+        })
+      },
+      {
+        id: run.id,
+        signal: clientAbortController.signal,
+        onQueued: ({ position, queueLength, activeCount }) => {
+          runBroadcast({
+            type: 'orchestration_queued',
+            runId: run.id,
+            position,
+            queueLength,
+            activeCount,
+            timestamp: new Date().toISOString(),
+          })
+        },
+        onAdmitted: ({ waitDurationMs, activeCount, queued }) => {
+          if (queued) {
+            runBroadcast({
+              type: 'orchestration_admitted',
+              runId: run.id,
+              waitDurationMs,
+              activeCount,
+              timestamp: new Date().toISOString(),
+            })
+          }
+        },
+      }
+    )
+
+    await runHistoryStore.completeRun(run.id, result)
     result.runId = run.id
     res.json(result)
   } catch (err) {
+    await runHistoryStore.failRun(run.id, err).catch(() => {})
     next(err)
+  } finally {
+    res.off?.('close', onClose)
+    req.off?.('aborted', onClose)
   }
+}
+
+// ─── Orchestrator Endpoints ──────────────────────────────────
+app.post('/api/orchestrate', validateOrchestrate, (req, res, next) => {
+  handleOrchestration(req, res, next, 'POST /api/orchestrate')
 })
 
 // Also support GET for easy testing
-app.get('/api/orchestrate', validateOrchestrate, async (req, res, next) => {
+app.get('/api/orchestrate', validateOrchestrate, (req, res, next) => {
+  handleOrchestration(req, res, next, 'GET /api/orchestrate')
+})
+
+app.get('/api/orchestrate/queue', (req, res) => {
+  res.json({
+    ...admissionQueue.getState(),
+    multiReplicaCoordination: false,
+    note: 'In-process admission queue bounds concurrency on this server instance; no cross-node distributed coordination.',
+    retryAfterDefaultSec: Math.max(1, Math.ceil(admissionQueue.queueTimeoutMs / 1000)),
+  })
+})
+
+app.post('/api/orchestrate/:id/cancel', async (req, res, next) => {
   try {
-    const { task, budget } = req.validated
-    const run = await runHistoryStore.createRun({
-      task,
-      budget,
-      source: 'GET /api/orchestrate',
-    })
-    const runBroadcast = (event) => {
-      const eventWithRun = { ...event, runId: run.id }
-      broadcast(eventWithRun)
-      runHistoryStore.appendEvent(run.id, eventWithRun).catch((persistErr) => {
-        logger.warn('run_history_append_failed', { runId: run.id, error: persistErr.message })
+    const { id } = req.params
+    const reason = req.body?.reason || 'User cancelled orchestration'
+    const cancelResult = admissionQueue.cancel(id, reason)
+
+    if (cancelResult.cancelled) {
+      broadcast({
+        type: 'orchestration_cancelled',
+        runId: id,
+        phase: cancelResult.phase,
+        reason,
+        timestamp: new Date().toISOString(),
+      })
+      return res.json({
+        success: true,
+        runId: id,
+        phase: cancelResult.phase,
+        message: `Orchestration run ${id} was cancelled (${cancelResult.phase} phase)`,
       })
     }
 
-    let result
-    try {
-      result = await orchestrate(task, budget, runBroadcast, { correlationId: req.requestId })
-      await runHistoryStore.completeRun(run.id, result)
-    } catch (err) {
-      await runHistoryStore.failRun(run.id, err)
-      throw err
+    const run = await runHistoryStore.getRun(id)
+    if (!run) {
+      const err = new Error(`Orchestration run ${id} not found`)
+      err.status = 404
+      err.code = 'NOT_FOUND'
+      return next(err)
     }
 
-    result.runId = run.id
-    res.json(result)
+    return res.status(409).json({
+      success: false,
+      runId: id,
+      status: run.status,
+      message: `Run ${id} cannot be cancelled because it is already ${run.status}`,
+    })
   } catch (err) {
     next(err)
   }
@@ -582,6 +650,11 @@ app.get('/api/status', (req, res) => {
       buyer: config.buyerAddress ? `${config.buyerAddress.slice(0, 8)}...` : 'not configured',
     },
     claudeEnabled: !!config.anthropicApiKey,
+    orchestrationQueue: {
+      ...admissionQueue.getState(),
+      multiReplicaCoordination: false,
+      note: 'In-process admission queue bounds concurrency on this node; no cross-node distributed coordination.',
+    },
     runHistory: {
       storage: config.runHistoryStorage,
       file: config.runHistoryStorage === 'file' ? config.runHistoryFile : null,
@@ -622,9 +695,13 @@ app.get('/', (req, res) => {
 app.use(errorHandler)
 
 // ─── Start Server ────────────────────────────────────────────
-const PORT = config.port
-app.listen(PORT, () => {
-  console.log(`
+const isMainModule =
+  process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+
+if (isMainModule) {
+  const PORT = config.port
+  app.listen(PORT, () => {
+    console.log(`
 ╔══════════════════════════════════════════════════╗
 ║         🧠 StellarMind — AI Agent Marketplace     ║
 ║         x402 Micropayments on Stellar Testnet     ║
@@ -639,4 +716,7 @@ app.listen(PORT, () => {
 ║  x402:       ${(config.serverAddress ? '✅ Active' : '⚠️  No wallet').padEnd(34)}║
 ╚══════════════════════════════════════════════════╝
   `)
-})
+  })
+}
+
+export { app, admissionQueue }
