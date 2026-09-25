@@ -19,6 +19,11 @@ services:
       start_period: 10s
     volumes:
       - ./logs:/app/logs
+      # Named volume rather than a bind mount, deliberately: Docker seeds a
+      # named volume from the image's /app/data, ownership included, so the
+      # non-root user can write to it. A host bind mount here would be created
+      # root-owned and bring the EACCES back.
+      - stellarmind_data:/app/data
     networks:
       - stellarmind
 
@@ -42,5 +47,7 @@ networks:
 
 volumes:
   redis_data:
+  # Run history (/app/data/run-history.json) survives container recreation.
+  stellarmind_data:
 
 # Generated for Stellar Wave bounty #28
