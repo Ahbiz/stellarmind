@@ -1,8 +1,8 @@
-openapi: "3.0.3"
+openapi: '3.0.3'
 info:
   title: StellarMind API
   description: REST API for the StellarMind agent orchestration platform
-  version: "1.0.0"
+  version: '1.0.0'
   contact:
     name: StellarMind Team
 servers:

@@ -32,6 +32,7 @@ import {
   recordUsageEntry,
   summarizeUsageByPhase,
 } from './usage.js'
+import { normalizeContent } from './response-normalization.js'
 
 // const anthropic = ... (imported from services.js)
 
@@ -215,6 +216,9 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
           // the Anthropic client ourselves, so provider token usage is
           // genuinely unknown here, not zero.
           usage: unavailableUsage(agent.model || null, 'x402_remote_call'),
+          // Likewise, there's no raw Anthropic content-block response to
+          // normalize for a remote x402 call.
+          responseMeta: null,
         }
       }
 
@@ -257,6 +261,7 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
   const serviceFn = SERVICE_MAP[agent.id]
   let result
   let capturedUsage = null
+  let capturedResponseMeta = null
   try {
     result = await serviceFn(input, {
       onRetryAttempt: (retry) => {
@@ -277,6 +282,11 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
       // most recent report — the one that actually produced `result`.
       onUsage: (usage) => {
         capturedUsage = usage
+      },
+      // Same for normalized content metadata (truncation, empty/unsupported
+      // content) — only a call that actually produced `result` reports one.
+      onResponseMeta: (meta) => {
+        capturedResponseMeta = meta
       },
     })
   } catch (err) {
@@ -311,7 +321,60 @@ async function callAgentViaX402(agent, input, broadcastFn, context = {}) {
     txHash,
     explorerUrl: paymentResult.explorerUrl || buildExplorerUrl(txHash),
     usage: capturedUsage || unavailableUsage(agent.model || null, 'no_usage_captured'),
+    responseMeta: capturedResponseMeta,
   }
+}
+
+/**
+ * Normalize and validate a raw planning message response into a usable
+ * plan, or throw with a specific `code` explaining why it was rejected.
+ *
+ * This is the "planning rejects an incomplete JSON result before execution"
+ * guardrail (issue #150): a truncated response, a response with no text
+ * content, invalid JSON, or JSON missing a `subtasks` array must never reach
+ * subtask execution — each is rejected explicitly here rather than being
+ * silently accepted (e.g. `{}` parses successfully but has no subtasks).
+ */
+export function parsePlanResponse(planResponse) {
+  const meta = normalizeContent(planResponse)
+
+  if (meta.truncated) {
+    const err = new Error(
+      `Planning response was truncated at the token limit (stop_reason: ${meta.stopReason})`
+    )
+    err.code = 'PLAN_TRUNCATED'
+    throw err
+  }
+
+  if (meta.empty) {
+    const err = new Error(
+      `Planning response contained no text content (blocks: ${meta.blockTypes.join(', ') || 'none'})`
+    )
+    err.code = 'PLAN_EMPTY'
+    throw err
+  }
+
+  const cleanJson = meta.text
+    .replace(/```json\n?/g, '')
+    .replace(/```\n?/g, '')
+    .trim()
+
+  let parsed
+  try {
+    parsed = JSON.parse(cleanJson)
+  } catch (parseErr) {
+    const err = new Error(`Planning response was not valid JSON: ${parseErr.message}`)
+    err.code = 'PLAN_INVALID_JSON'
+    throw err
+  }
+
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.subtasks)) {
+    const err = new Error('Planning response is missing a valid "subtasks" array')
+    err.code = 'PLAN_MISSING_SUBTASKS'
+    throw err
+  }
+
+  return parsed
 }
 
 const PLANNING_MODEL = 'claude-haiku-4-5-20251001'
@@ -390,23 +453,20 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       }
     )
 
-    // Capture usage from the successful call before parsing — a malformed
-    // plan (JSON.parse failure below) still consumed real provider tokens.
+    // Capture usage from the successful call before parsing — a rejected
+    // plan (truncated, empty, invalid JSON, or missing subtasks) still
+    // consumed real provider tokens.
     planningUsageEntry = recordUsageEntry(
       'planning',
       null,
       usageFromMessage(planResponse, PLANNING_MODEL)
     )
 
-    const planText = planResponse.content[0].type === 'text' ? planResponse.content[0].text : '{}'
-    const cleanJson = planText
-      .replace(/```json\n?/g, '')
-      .replace(/```\n?/g, '')
-      .trim()
-    plan = JSON.parse(cleanJson)
+    plan = parsePlanResponse(planResponse)
   } catch (err) {
     logger.warn('orchestrator_planning_fallback', {
       correlationId: context.correlationId,
+      code: err.code || null,
       error: err.message?.substring(0, 120),
     })
     // Only record "unavailable" if we didn't already capture real usage
@@ -526,6 +586,20 @@ Respond ONLY with valid JSON (no markdown, no code fences):
     const stepUsageEntry = recordUsageEntry('agent', agent.id, agentResponse.usage)
     usageEntries.push(stepUsageEntry)
 
+    // Surface truncation/empty-content explicitly rather than letting a
+    // cut-off or blank agent output pass silently as a normal result.
+    if (agentResponse.responseMeta?.truncated || agentResponse.responseMeta?.empty) {
+      broadcastFn?.({
+        type: 'agent_response_incomplete',
+        agent: agent.name,
+        agentId: agent.id,
+        truncated: !!agentResponse.responseMeta.truncated,
+        empty: !!agentResponse.responseMeta.empty,
+        stopReason: agentResponse.responseMeta.stopReason,
+        timestamp: new Date().toISOString(),
+      })
+    }
+
     const agentResult = {
       agentId: agent.id,
       agentName: agent.name,
@@ -539,6 +613,9 @@ Respond ONLY with valid JSON (no markdown, no code fences):
       txHash: agentResponse.txHash || null,
       explorerUrl: agentResponse.explorerUrl || null,
       usage: stepUsageEntry,
+      // Content-block normalization metadata (issue #150) — null for x402
+      // remote calls, where no raw Anthropic response exists to normalize.
+      responseMeta: agentResponse.responseMeta || null,
     }
 
     results.push(agentResult)

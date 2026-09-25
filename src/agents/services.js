@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { config } from '../config.js'
 import { usageFromMessage, unavailableUsage } from './usage.js'
+import { normalizeContent } from './response-normalization.js'
 
 export let anthropic = new Anthropic({ apiKey: config.anthropicApiKey })
 
@@ -223,7 +224,23 @@ async function callClaude(model, maxTokens, prompt, fallbackFn, fallbackInput, o
     )
     claudeAvailable = true
     options.onUsage?.(usageFromMessage(msg, model))
-    return msg.content[0].type === 'text' ? msg.content[0].text : ''
+
+    // Combine every text block (not just content[0]) and surface
+    // stop/completion metadata so callers can tell a truncated or empty
+    // response apart from a normal, complete one.
+    const normalized = normalizeContent(msg)
+    options.onResponseMeta?.(normalized)
+    if (normalized.truncated) {
+      console.warn(`  WARNING: Claude response truncated at token limit (model: ${model})`)
+    }
+    if (normalized.empty) {
+      console.warn(
+        `  WARNING: Claude response had no text content (model: ${model}, blocks: ${
+          normalized.blockTypes.join(', ') || 'none'
+        })`
+      )
+    }
+    return normalized.text
   } catch (err) {
     console.error(`Claude API error: ${err.message}`)
     if (
