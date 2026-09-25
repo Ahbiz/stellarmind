@@ -6,9 +6,117 @@ import {
   Operation,
   Asset,
 } from '@stellar/stellar-sdk'
+import { config } from '../config.js'
 
 const HORIZON_URL = 'https://horizon-testnet.stellar.org'
 const server = new Horizon.Server(HORIZON_URL)
+
+// ── Bounded concurrency and caching for per-transaction operation lookups ─────
+//
+// Decorating a page of transactions with their operations used to mean one
+// Horizon request per transaction, all launched at once by `Promise.all`: a page
+// of 100 transactions fired 100 concurrent requests, and a refresh re-fetched
+// operations that cannot change for a transaction already in a closed ledger.
+
+/**
+ * Run `mapper` over `items` with at most `limit` promises in flight.
+ * Results keep the order of `items`.
+ */
+export async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length)
+  let nextIndex = 0
+  const width = Math.max(1, Math.min(limit, items.length))
+
+  const workers = Array.from({ length: width }, async () => {
+    for (;;) {
+      const index = nextIndex++
+      if (index >= items.length) return
+      results[index] = await mapper(items[index], index)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
+
+/** Successful lookups only: a failed fetch must not be cached as "no operations". */
+const operationsCache = new Map()
+
+export function clearOperationsCache() {
+  operationsCache.clear()
+}
+
+export function operationsCacheEntryCount() {
+  return operationsCache.size
+}
+
+function cacheLookup(hash) {
+  if (!operationsCache.has(hash)) return undefined
+  const value = operationsCache.get(hash)
+  // Re-insert so the least recently used entry is the one evicted below.
+  operationsCache.delete(hash)
+  operationsCache.set(hash, value)
+  return value
+}
+
+function cacheStore(hash, operations) {
+  if (config.horizonOpsCacheSize <= 0) return
+  operationsCache.set(hash, operations)
+  while (operationsCache.size > config.horizonOpsCacheSize) {
+    operationsCache.delete(operationsCache.keys().next().value)
+  }
+}
+
+/**
+ * Operations for a single transaction, cached after the first successful lookup.
+ *
+ * Returns `{ operations, error }`: an empty list because the transaction has no
+ * operations is a different outcome from a lookup that failed, and the caller
+ * has to be able to show that difference.
+ */
+export async function fetchTransactionOperations(hash, horizonServer = server) {
+  const cached = cacheLookup(hash)
+  if (cached) return { operations: cached, error: null }
+
+  try {
+    const opsResp = await horizonServer
+      .operations()
+      .forTransaction(hash)
+      .order('asc')
+      .limit(10)
+      .call()
+
+    const operations = opsResp.records.map((op) => {
+      const assetCode =
+        op.asset_type === 'native'
+          ? 'XLM'
+          : op.asset_code || op.selling_asset_code || op.buying_asset_code || null
+
+      const amount =
+        op.amount ||
+        op.starting_balance ||
+        op.send_amount ||
+        op.dest_amount ||
+        op.buy_amount ||
+        op.source_amount ||
+        null
+
+      return {
+        id: op.id,
+        type: op.type,
+        amount,
+        asset_code: assetCode,
+        from: op.from || op.source_account || null,
+        to: op.to || op.account || op.destination || null,
+      }
+    })
+
+    cacheStore(hash, operations)
+    return { operations, error: null }
+  } catch (err) {
+    return { operations: [], error: err.message }
+  }
+}
 
 /**
  * Get balance for a Stellar public key
@@ -102,43 +210,14 @@ export async function getTransactions(publicKey, limit = 10, cursor = null, orde
 
     const txs = await query.call()
 
-    const decorated = await Promise.all(
-      txs.records.map(async (tx) => {
-        let operations = []
-        try {
-          const opsResp = await server
-            .operations()
-            .forTransaction(tx.hash)
-            .order('asc')
-            .limit(10)
-            .call()
+    const decorated = await mapWithConcurrency(
+      txs.records,
+      config.horizonOpsMaxConcurrency,
+      async (tx) => {
+        const { operations, error } = await fetchTransactionOperations(tx.hash)
 
-          operations = opsResp.records.map((op) => {
-            const assetCode =
-              op.asset_type === 'native'
-                ? 'XLM'
-                : op.asset_code || op.selling_asset_code || op.buying_asset_code || null
-
-            const amount =
-              op.amount ||
-              op.starting_balance ||
-              op.send_amount ||
-              op.dest_amount ||
-              op.buy_amount ||
-              op.source_amount ||
-              null
-
-            return {
-              id: op.id,
-              type: op.type,
-              amount,
-              asset_code: assetCode,
-              from: op.from || op.source_account || null,
-              to: op.to || op.account || op.destination || null,
-            }
-          })
-        } catch (err) {
-          console.warn(`Failed to fetch operations for tx ${tx.hash}:`, err.message)
+        if (error) {
+          console.warn(`Failed to fetch operations for tx ${tx.hash}:`, error)
         }
 
         return {
@@ -154,9 +233,12 @@ export async function getTransactions(publicKey, limit = 10, cursor = null, orde
           operation_count: tx.operation_count,
           successful: tx.successful,
           operations,
+          // Distinguishes "this transaction has no operations" from "the lookup
+          // failed" — both used to arrive as an empty array.
+          ...(error ? { operationsError: error } : {}),
           explorerUrl: `https://stellar.expert/explorer/testnet/tx/${tx.hash}`,
         }
-      })
+      }
     )
 
     return decorated
